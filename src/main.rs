@@ -1,14 +1,22 @@
 use core::panic;
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::env;
 use std::sync::Arc;
 
 use serenity::async_trait;
+use serenity::builder;
+use serenity::builder::CreateEmbed;
 use serenity::client::bridge::gateway::ShardManager;
 use serenity::http::Http;
+use serenity::model::application::command::{Command, CommandOptionType};
+use serenity::model::application::interaction::application_command::CommandDataOptionValue;
+use serenity::model::application::interaction::{Interaction, InteractionResponseType};
+use serenity::model::channel::Embed;
 use serenity::model::event::ResumedEvent;
 use serenity::model::gateway::Ready;
+use serenity::model::id::GuildId;
 use serenity::prelude::*;
+use serenity::utils::CustomMessage;
 use tracing::{debug, error, info};
 
 pub struct ShardManagerContainer;
@@ -17,20 +25,79 @@ impl TypeMapKey for ShardManagerContainer {
     type Value = Arc<Mutex<ShardManager>>;
 }
 
-
 struct Handler;
 
 #[async_trait]
 impl EventHandler for Handler {
-    async fn ready(&self, _: Context, ready: Ready) {
+    async fn ready(&self, ctx: Context, ready: Ready) {
         info!("Connected as {}", ready.user.name);
-        debug!("{}", ready.user.id)
+        debug!("ID: {}", ready.user.id);
+
+        let guild_id = GuildId(
+            env::var("GUILD_ID")
+                .expect("Expected GUILD_ID in environment")
+                .parse()
+                .expect("GUILD_ID must be an integer"),
+        );
+
+        let commands = GuildId::set_application_commands(&guild_id, &ctx.http, |commands|{
+            commands
+                .create_application_command(|command| {
+                    command
+                        .name("info")
+                        .description("Get info about the bot")
+                })
+        })
+        .await;
+        debug!("Activated the following guild slash commands: {:?}", commands)
+
+        // create and activate global slash commands here
     }
 
     async fn resume(&self, _: Context, _: ResumedEvent) {
         info!("Resumed")
     }
-    // TODO: add interaction (slash commands, et. al.) events
+
+    async fn interaction_create(&self, ctx: Context, interaction: Interaction) {
+        if let Interaction::ApplicationCommand(command) = interaction {
+            debug!("Recived command interaction: {:?}", command);
+
+            let (respond_ephemeral, content, embeds) = match command.data.name.as_str() {
+                _ => {
+                    let embed = CreateEmbed(HashMap::from([(
+                        "Embed",
+                        Embed::fake(|e| {
+                            e.title("This is a title")
+                                .description("This is a description")
+                                .fields(vec![
+                                    ("This is the first field", "This is a field body", true),
+                                    ("This is the second field", "Both fields are inline", true),
+                                ])
+                                .field("This is the third field", "This is not an inline field", false)
+                                .footer(|f| f.text("This is a footer"))
+                        })
+                    )]));
+                    (false, "Not implemented".to_string(), vec![embed]) // no embeds so return empty vec
+                }
+            };
+            debug!("Embeds: {:?}", &embeds);
+            if let Err(why) = command
+                .create_interaction_response(&ctx.http, |response| {
+                    response
+                        .kind(InteractionResponseType::ChannelMessageWithSource)
+                        .interaction_response_data(|message| {
+                            message
+                                .ephemeral(respond_ephemeral)
+                                .content(content)
+                                .set_embeds(embeds)
+                        })
+                })
+                .await
+            {
+                error!("Cannot respond to slash command: {}", why)
+            }
+        }
+    }
 }
 
 // will not be using the normal message commands
@@ -52,8 +119,6 @@ async fn main() {
     // load token
     let token = env::var("DISCORD_TOKEN").expect("Expected a token in environment");
 
-
-    
     // not sure what this is, following examples
     let http = Http::new(&token);
 
@@ -64,7 +129,7 @@ async fn main() {
             owners.insert(info.owner.id);
 
             (owners, info.id)
-        },
+        }
         Err(why) => panic!("Could not access application info: {:?}", why),
     };
     debug!("Owners: {:?}", owners);
@@ -76,7 +141,7 @@ async fn main() {
         .event_handler(Handler)
         .await
         .expect("Error creating client");
-    
+
     {
         let mut data = client.data.write().await;
         data.insert::<ShardManagerContainer>(client.shard_manager.clone());
@@ -85,7 +150,9 @@ async fn main() {
     let shard_manager = client.shard_manager.clone();
 
     tokio::spawn(async move {
-        tokio::signal::ctrl_c().await.expect("Could not register ctrl+c handler");
+        tokio::signal::ctrl_c()
+            .await
+            .expect("Could not register ctrl+c handler");
         shard_manager.lock().await.shutdown_all().await;
     });
 
