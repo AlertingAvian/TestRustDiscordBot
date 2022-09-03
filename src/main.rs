@@ -1,22 +1,19 @@
 use core::panic;
-use std::collections::{HashMap, HashSet};
+use std::collections::HashSet;
 use std::env;
 use std::sync::Arc;
 
 use serenity::async_trait;
-use serenity::builder;
-use serenity::builder::CreateEmbed;
+use serenity::builder::{CreateEmbed, CreateComponents};
 use serenity::client::bridge::gateway::ShardManager;
 use serenity::http::Http;
 use serenity::model::application::command::{Command, CommandOptionType};
 use serenity::model::application::interaction::application_command::CommandDataOptionValue;
 use serenity::model::application::interaction::{Interaction, InteractionResponseType};
-use serenity::model::channel::Embed;
 use serenity::model::event::ResumedEvent;
 use serenity::model::gateway::Ready;
 use serenity::model::id::GuildId;
 use serenity::prelude::*;
-use serenity::utils::CustomMessage;
 use tracing::{debug, error, info};
 
 pub struct ShardManagerContainer;
@@ -62,25 +59,20 @@ impl EventHandler for Handler {
         if let Interaction::ApplicationCommand(command) = interaction {
             debug!("Recived command interaction: {:?}", command);
 
-            let (respond_ephemeral, content, embeds) = match command.data.name.as_str() {
+            let (respond_ephemeral, content, embeds, components) = match command.data.name.as_str() {
                 _ => {
-                    let embed = CreateEmbed(HashMap::from([(
-                        "Embed",
-                        Embed::fake(|e| {
-                            e.title("This is a title")
-                                .description("This is a description")
-                                .fields(vec![
-                                    ("This is the first field", "This is a field body", true),
-                                    ("This is the second field", "Both fields are inline", true),
-                                ])
-                                .field("This is the third field", "This is not an inline field", false)
-                                .footer(|f| f.text("This is a footer"))
-                        })
-                    )]));
-                    (false, "Not implemented".to_string(), vec![embed]) // no embeds so return empty vec
+                    let content = "".to_string();
+
+                    let mut embed = CreateEmbed::default();
+                    embed.title("Error");
+                    embed.description("Not Implemented");
+                    embed.color((255, 0, 0));
+
+                    let components = CreateComponents::default(); // default components don't inclulde any
+                    
+                    (true, content, vec![embed], components)
                 }
             };
-            debug!("Embeds: {:?}", &embeds);
             if let Err(why) = command
                 .create_interaction_response(&ctx.http, |response| {
                     response
@@ -90,6 +82,8 @@ impl EventHandler for Handler {
                                 .ephemeral(respond_ephemeral)
                                 .content(content)
                                 .set_embeds(embeds)
+                                .set_components(components)
+                                //.add_files() // will probably want to work in support for files at some point
                         })
                 })
                 .await
