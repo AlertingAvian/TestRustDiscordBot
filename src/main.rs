@@ -3,8 +3,9 @@ use std::collections::HashSet;
 use std::env;
 use std::sync::Arc;
 
+use rand::Rng;
 use serenity::async_trait;
-use serenity::builder::{CreateEmbed, CreateComponents};
+use serenity::builder::{CreateComponents, CreateEmbed};
 use serenity::client::bridge::gateway::ShardManager;
 use serenity::http::Http;
 use serenity::model::application::command::{Command, CommandOptionType};
@@ -14,12 +15,19 @@ use serenity::model::event::ResumedEvent;
 use serenity::model::gateway::Ready;
 use serenity::model::id::GuildId;
 use serenity::prelude::*;
-use tracing::{debug, error, info};
+use tokio::sync::RwLock;
+use tracing::{debug, error, info, warn};
 
 pub struct ShardManagerContainer;
 
 impl TypeMapKey for ShardManagerContainer {
     type Value = Arc<Mutex<ShardManager>>;
+}
+
+pub struct Owners;
+
+impl TypeMapKey for Owners {
+    type Value = Arc<RwLock<HashSet<serenity::model::prelude::UserId>>>;
 }
 
 struct Handler;
@@ -37,18 +45,33 @@ impl EventHandler for Handler {
                 .expect("GUILD_ID must be an integer"),
         );
 
-        let commands = GuildId::set_application_commands(&guild_id, &ctx.http, |commands|{
+        let guild_commands = GuildId::set_application_commands(&guild_id, &ctx.http, |commands| {
+            commands.create_application_command(|command| {
+                command
+                    .name("shutdown")
+                    .description("Owner only, shuts the bot down.")
+            })
+        })
+        .await;
+        debug!(
+            "Activated the following guild slash commands: {:?}",
+            guild_commands
+        );
+
+        let global_commands = Command::set_global_application_commands(&ctx.http, |commands| {
             commands
                 .create_application_command(|command| {
-                    command
-                        .name("info")
-                        .description("Get info about the bot")
+                    command.name("info").description("Get info about the bot")
+                })
+                .create_application_command(|command| {
+                    command.name("xkcd").description("Get random xkcd comic.")
                 })
         })
         .await;
-        debug!("Activated the following guild slash commands: {:?}", commands)
-
-        // create and activate global slash commands here
+        debug!(
+            "Activated the following global slash commands: {:?}",
+            global_commands
+        )
     }
 
     async fn resume(&self, _: Context, _: ResumedEvent) {
@@ -59,7 +82,60 @@ impl EventHandler for Handler {
         if let Interaction::ApplicationCommand(command) = interaction {
             debug!("Recived command interaction: {:?}", command);
 
-            let (respond_ephemeral, content, embeds, components) = match command.data.name.as_str() {
+            let (respond_ephemeral, content, embeds, components) = match command.data.name.as_str()
+            {
+                "info" => {
+                    let content = "Test bot created by AlertingAvian".to_string();
+
+                    (true, content, vec![], CreateComponents::default())
+                }
+                "xkcd" => {
+                    let mut rng = rand::thread_rng();
+
+                    let content = format!("https://xkcd.com/{}/", rng.gen_range(1..2667)); // the lazy way to do it
+
+                    (false, content, vec![], CreateComponents::default())
+                }
+                "shutdown" => {
+                    info!("shutdown command invoked");
+                    let mut content = String::new(); // it is used, i think it might be angry because of the return statement
+                    let owners = {
+                        let data_read = ctx.data.read().await;
+                        let owners_lock = data_read
+                            .get::<Owners>()
+                            .expect("Expected Owners in TypeMap")
+                            .clone();
+
+                        let owners = owners_lock.read().await;
+                        owners.clone()
+                    };
+                    if owners.contains(&command.user.id) {
+                        let data = ctx.data.read().await;
+
+                        if let Some(manager) = data.get::<ShardManagerContainer>() {
+                            if let Err(why) = command
+                                .create_interaction_response(&ctx.http, |response| {
+                                    response
+                                        .kind(InteractionResponseType::ChannelMessageWithSource)
+                                        .interaction_response_data(|message| {
+                                            message.ephemeral(true).content("Shutting down")
+                                        })
+                                })
+                                .await
+                            {
+                                error!("Cannot respond to slash command: {}", why);
+                            }
+                            manager.lock().await.shutdown_all().await;
+                            return;
+                        } else {
+                            content = "There was a problem getting the shard manager".to_string();
+                        }
+                    } else {
+                        content = "You shouldn't have this.".to_string();
+                        warn!("User with insufficient permissions invoked Shutdown command!");
+                    }
+                    (true, content, vec![], CreateComponents::default())
+                }
                 _ => {
                     let content = "".to_string();
 
@@ -68,9 +144,7 @@ impl EventHandler for Handler {
                     embed.description("Not Implemented");
                     embed.color((255, 0, 0));
 
-                    let components = CreateComponents::default(); // default components don't inclulde any
-                    
-                    (true, content, vec![embed], components)
+                    (true, content, vec![embed], CreateComponents::default())
                 }
             };
             if let Err(why) = command
@@ -83,12 +157,12 @@ impl EventHandler for Handler {
                                 .content(content)
                                 .set_embeds(embeds)
                                 .set_components(components)
-                                //.add_files() // will probably want to work in support for files at some point
+                            //.add_files() // will probably want to work in support for files at some point
                         })
                 })
                 .await
             {
-                error!("Cannot respond to slash command: {}", why)
+                error!("Cannot respond to slash command: {}", why);
             }
         }
     }
@@ -103,12 +177,7 @@ async fn main() {
 
     // init logger to use environment vars
     tracing_subscriber::fmt::init();
-    // let file_appender = tracing_appender::rolling::hourly("./", "bot.log");
-    // let (non_blocking, _guard) = tracing_appender::non_blocking(file_appender);
-    // tracing_subscriber::fmt() // dont know how to get it to set with the env var when file logging
-    //     .with_writer(non_blocking)
-    //     .with_writer(std::io::stderr)
-    //     .init();
+    // TODO: Have log to stdout and to a file
 
     // load token
     let token = env::var("DISCORD_TOKEN").expect("Expected a token in environment");
@@ -142,6 +211,11 @@ async fn main() {
     }
 
     let shard_manager = client.shard_manager.clone();
+
+    {
+        let mut data = client.data.write().await;
+        data.insert::<Owners>(Arc::new(RwLock::new(owners)))
+    }
 
     tokio::spawn(async move {
         tokio::signal::ctrl_c()
